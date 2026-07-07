@@ -1,0 +1,57 @@
+//@version=6
+indicator("Dynamic Support & Resistance", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// --- Inputs ---
+pivotLength    = input.int(10, "Pivot Lookback (bars each side)", minval=1, group="Pivot Detection", tooltip="Number of bars on each side of a swing high/low required to confirm it. Lower = more reactive but noisier on 1min charts.")
+lineWidth      = input.int(2, "Line Width", minval=1, maxval=4, group="Appearance")
+resistanceCol  = input.color(color.new(color.red, 0), "Resistance Color", group="Appearance")
+supportCol     = input.color(color.new(color.lime, 0), "Support Color", group="Appearance")
+showBreakLabels = input.bool(true, "Show Break Labels", group="Appearance")
+
+// --- Pivot detection ---
+ph = ta.pivothigh(pivotLength, pivotLength)
+pl = ta.pivotlow(pivotLength, pivotLength)
+
+var float resistanceLevel = na
+var float supportLevel    = na
+var line  resistanceLine  = na
+var line  supportLine     = na
+
+pivotBarIndex = bar_index - pivotLength
+
+// New confirmed swing high -> replace resistance line
+if not na(ph)
+    if not na(resistanceLine)
+        line.set_extend(resistanceLine, extend.none)
+        line.set_x2(resistanceLine, pivotBarIndex)
+    resistanceLevel := ph
+    resistanceLine  := line.new(pivotBarIndex, resistanceLevel, bar_index, resistanceLevel, xloc.bar_index, extend=extend.right, color=resistanceCol, width=lineWidth, style=line.style_solid)
+
+// New confirmed swing low -> replace support line
+if not na(pl)
+    if not na(supportLine)
+        line.set_extend(supportLine, extend.none)
+        line.set_x2(supportLine, pivotBarIndex)
+    supportLevel := pl
+    supportLine  := line.new(pivotBarIndex, supportLevel, bar_index, supportLevel, xloc.bar_index, extend=extend.right, color=supportCol, width=lineWidth, style=line.style_solid)
+
+// --- Break detection: stop the broken line, wait for the next swing pivot to draw a new one ---
+brokeResistance = not na(resistanceLevel) and ta.crossover(close, resistanceLevel)
+brokeSupport    = not na(supportLevel) and ta.crossunder(close, supportLevel)
+
+if brokeResistance
+    line.set_extend(resistanceLine, extend.none)
+    line.set_x2(resistanceLine, bar_index)
+    if showBreakLabels
+        label.new(bar_index, resistanceLevel, "Broke R", style=label.style_label_down, color=resistanceCol, textcolor=color.white, size=size.small)
+    resistanceLevel := na
+
+if brokeSupport
+    line.set_extend(supportLine, extend.none)
+    line.set_x2(supportLine, bar_index)
+    if showBreakLabels
+        label.new(bar_index, supportLevel, "Broke S", style=label.style_label_up, color=supportCol, textcolor=color.white, size=size.small)
+    supportLevel := na
+
+alertcondition(brokeResistance, "Resistance Broken", "Price broke above resistance")
+alertcondition(brokeSupport, "Support Broken", "Price broke below support")
