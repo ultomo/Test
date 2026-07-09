@@ -26,12 +26,25 @@ s4On   = input.bool(false, "Enable", group="Session 4", inline="s4")
 s4Name = input.string("Power Hour", "", group="Session 4", inline="s4")
 s4Sess = input.session("1500-1515", "Window", group="Session 4")
 
+// --- Session window detection (computed up front so every ORB can see when any other ORB opens) ---
+sessionInRange(simple bool enabled, simple string sess) =>
+    enabled and not na(time(timeframe.period, sess, tzName))
+
+in1 = sessionInRange(s1On, s1Sess)
+in2 = sessionInRange(s2On, s2Sess)
+in3 = sessionInRange(s3On, s3Sess)
+in4 = sessionInRange(s4On, s4Sess)
+
+start1 = in1 and not in1[1]
+start2 = in2 and not in2[1]
+start3 = in3 and not in3[1]
+start4 = in4 and not in4[1]
+
+anyOrbStart = start1 or start2 or start3 or start4
+
 // --- ORB engine: tracks one session's opening range, draws its lines/labels, returns breakout signals ---
-orb(simple bool enabled, simple string sess, simple string name) =>
-    bool inWindow  = not na(time(timeframe.period, sess, tzName))
-    bool inRange   = enabled and inWindow
-    bool rangeStart = inRange and not inRange[1]
-    bool rangeEnd   = not inRange and inRange[1]
+orb(bool inRange, bool rangeStart, bool anyStart, simple string name) =>
+    bool rangeEnd = not inRange and inRange[1]
 
     var float orbHigh   = na
     var float orbLow    = na
@@ -72,7 +85,7 @@ orb(simple bool enabled, simple string sess, simple string name) =>
         loLabel  := label.new(bar_index, orbLow,  name + " Low "  + str.tostring(orbLow,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=lowCol,  size=labelSize)
         midLabel := label.new(bar_index, orbMid,  name + " Mid "  + str.tostring(orbMid,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=midCol,  size=labelSize)
 
-    // Extend the lines (and keep the labels at their ends) until this session's next opening range begins
+    // Extend the lines (and keep the labels at their ends) until another ORB opens or this session restarts
     if not inRange and not na(hiLine)
         line.set_x2(hiLine, bar_index)
         line.set_x2(loLine, bar_index)
@@ -80,16 +93,25 @@ orb(simple bool enabled, simple string sess, simple string name) =>
         label.set_x(hiLabel, bar_index)
         label.set_x(loLabel, bar_index)
         label.set_x(midLabel, bar_index)
+        // A new ORB has taken over: stop this one exactly where the new one starts
+        if anyStart
+            rangeDone := false
+            hiLine  := na
+            loLine  := na
+            midLine := na
+            hiLabel  := na
+            loLabel  := na
+            midLabel := na
 
     bool brokeHigh = rangeDone and ta.crossover(close, orbHigh)
     bool brokeLow  = rangeDone and ta.crossunder(close, orbLow)
     [brokeHigh, brokeLow]
 
 // --- Run each configured session ---
-[s1BrokeHigh, s1BrokeLow] = orb(s1On, s1Sess, s1Name)
-[s2BrokeHigh, s2BrokeLow] = orb(s2On, s2Sess, s2Name)
-[s3BrokeHigh, s3BrokeLow] = orb(s3On, s3Sess, s3Name)
-[s4BrokeHigh, s4BrokeLow] = orb(s4On, s4Sess, s4Name)
+[s1BrokeHigh, s1BrokeLow] = orb(in1, start1, anyOrbStart, s1Name)
+[s2BrokeHigh, s2BrokeLow] = orb(in2, start2, anyOrbStart, s2Name)
+[s3BrokeHigh, s3BrokeLow] = orb(in3, start3, anyOrbStart, s3Name)
+[s4BrokeHigh, s4BrokeLow] = orb(in4, start4, anyOrbStart, s4Name)
 
 // --- Breakout alerts ---
 alertcondition(s1BrokeHigh, "Session 1 High Break", "Price broke above the Session 1 opening range high")
