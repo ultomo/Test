@@ -1,0 +1,72 @@
+//@version=6
+indicator("ORB — 15 Min Opening Range", "ORB 15m", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// --- Inputs ---
+orbSession = input.session("0930-0945", "Opening Range Window", group="Opening Range", tooltip="The 15-minute opening range window. Use a chart timeframe of 15 minutes or lower so the range is measured accurately.")
+tzName     = input.string("America/New_York", "Timezone", group="Opening Range", tooltip="IANA timezone used to interpret the window above, e.g. America/New_York, Europe/London, Asia/Tokyo.")
+
+highCol   = input.color(color.new(color.green, 0), "High Line", group="Appearance")
+lowCol    = input.color(color.new(color.red, 0), "Low Line", group="Appearance")
+midCol    = input.color(color.new(color.orange, 0), "Midpoint Line", group="Appearance")
+lineW     = input.int(2, "Line Width", minval=1, maxval=4, group="Appearance")
+labelSize = input.string(size.small, "Label Size", options=[size.tiny, size.small, size.normal, size.large], group="Appearance")
+
+// --- Opening range detection ---
+inRange    = not na(time(timeframe.period, orbSession, tzName))
+rangeStart = inRange and not inRange[1]
+rangeEnd   = not inRange and inRange[1]
+
+var float orbHigh   = na
+var float orbLow    = na
+var int   startBar  = na
+var bool  rangeDone = false
+
+var line  hiLine  = na
+var line  loLine  = na
+var line  midLine = na
+var label hiLabel  = na
+var label loLabel  = na
+var label midLabel = na
+
+// New session: reset the range and freeze yesterday's lines where they ended
+if rangeStart
+    orbHigh   := high
+    orbLow    := low
+    startBar  := bar_index
+    rangeDone := false
+    hiLine  := na
+    loLine  := na
+    midLine := na
+    hiLabel  := na
+    loLabel  := na
+    midLabel := na
+else if inRange
+    orbHigh := math.max(orbHigh, high)
+    orbLow  := math.min(orbLow, low)
+
+// Range complete: draw high, low, and midpoint lines with price labels at their ends
+if rangeEnd and not na(orbHigh)
+    rangeDone := true
+    float orbMid = (orbHigh + orbLow) / 2
+    hiLine  := line.new(startBar, orbHigh, bar_index, orbHigh, color=highCol, width=lineW, style=line.style_solid)
+    loLine  := line.new(startBar, orbLow,  bar_index, orbLow,  color=lowCol,  width=lineW, style=line.style_solid)
+    midLine := line.new(startBar, orbMid,  bar_index, orbMid,  color=midCol,  width=lineW, style=line.style_solid)
+    hiLabel  := label.new(bar_index, orbHigh, "ORB High " + str.tostring(orbHigh, format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=highCol, size=labelSize)
+    loLabel  := label.new(bar_index, orbLow,  "ORB Low "  + str.tostring(orbLow,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=lowCol,  size=labelSize)
+    midLabel := label.new(bar_index, orbMid,  "ORB Mid "  + str.tostring(orbMid,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=midCol,  size=labelSize)
+
+// Extend the lines (and keep the labels at their ends) until the next opening range begins
+if not inRange and not na(hiLine)
+    line.set_x2(hiLine, bar_index)
+    line.set_x2(loLine, bar_index)
+    line.set_x2(midLine, bar_index)
+    label.set_x(hiLabel, bar_index)
+    label.set_x(loLabel, bar_index)
+    label.set_x(midLabel, bar_index)
+
+// --- Breakout alerts ---
+brokeHigh = rangeDone and ta.crossover(close, orbHigh)
+brokeLow  = rangeDone and ta.crossunder(close, orbLow)
+
+alertcondition(brokeHigh, "ORB High Break", "Price broke above the opening range high")
+alertcondition(brokeLow, "ORB Low Break", "Price broke below the opening range low")
