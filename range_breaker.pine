@@ -1,0 +1,137 @@
+//@version=6
+indicator("Range Breaker — Adaptive Volatility Boxes", "Range Breaker", overlay=true, max_boxes_count=250, max_lines_count=250, max_labels_count=500)
+
+// --- Inputs: Range Detection ---
+grpD = "Range Detection"
+lookback   = input.int(20, "Compression Lookback", minval=5, group=grpD, tooltip="Number of bars over which the highest-high / lowest-low span is measured and tested for compression.")
+atrLen     = input.int(14, "ATR Length", minval=1, group=grpD)
+tightMult  = input.float(2.0, "Tightness Threshold (× ATR)", minval=0.5, step=0.1, group=grpD, tooltip="A consolidation begins when the lookback range is smaller than ATR × this value. Lower values demand tighter compression.")
+expandMult = input.float(1.25, "Max Expansion (× Threshold)", minval=1.0, step=0.05, group=grpD, tooltip="How far an active box may stretch, relative to the tightness threshold, before boundary pushes are rejected instead of absorbed. This is what lets the range 'breathe' without invalidating.")
+minBars    = input.int(5, "Min Range Age For Signals (bars)", minval=0, group=grpD, tooltip="Signals are suppressed until the range has lived this many bars, filtering out noise from ranges that barely formed.")
+maxBars    = input.int(200, "Max Range Duration (0 = unlimited)", minval=0, group=grpD, tooltip="A range older than this is considered stale and is abandoned without a signal.")
+
+// --- Inputs: Signals ---
+grpS = "Signals"
+sigMode  = input.string("Both", "Signal Mode", options=["Momentum Breakouts", "Wick Reversals", "Both"], group=grpS)
+bufMult  = input.float(0.10, "Breakout Buffer (× ATR)", minval=0.0, step=0.05, group=grpS, tooltip="The close must clear the box boundary by this ATR fraction to count as a momentum breakout.")
+wickMult = input.float(0.25, "Min Wick Probe (× ATR)", minval=0.05, step=0.05, group=grpS, tooltip="A probe must poke at least this far beyond the boundary — and close back inside — to arm a wick-reversal setup. The next candle must confirm it.")
+
+// --- Inputs: Appearance ---
+grpV = "Appearance"
+colBox   = input.color(color.new(color.blue, 0), "Active Range", group=grpV)
+colUp    = input.color(color.new(color.green, 0), "Bullish Resolution", group=grpV)
+colDn    = input.color(color.new(color.red, 0), "Bearish Resolution", group=grpV)
+colStale = input.color(color.new(color.gray, 0), "Expired Range", group=grpV)
+fillTr   = input.int(90, "Box Fill Transparency", minval=0, maxval=100, group=grpV)
+showMid  = input.bool(true, "Show Midline", group=grpV)
+
+useBreak = sigMode != "Wick Reversals"
+useWick  = sigMode != "Momentum Breakouts"
+
+// --- Volatility compression filter ---
+atr = ta.atr(atrLen)
+hh  = ta.highest(high, lookback)
+ll  = ta.lowest(low, lookback)
+isTight = not na(atr) and (hh - ll) < atr * tightMult
+
+buffer   = atr * bufMult
+maxWidth = atr * tightMult * expandMult
+
+// --- Range state ---
+var bool  inRange = false
+var float rTop    = na
+var float rBot    = na
+var int   rStart  = na
+var box   rBox    = na
+var line  rMid    = na
+var bool  pendUp  = false // wick probed above the box last bar; awaiting confirmation
+var bool  pendDn  = false // wick probed below the box last bar; awaiting confirmation
+
+bool newRange     = false
+bool breakUp      = false
+bool breakDn      = false
+bool fadeLong     = false
+bool fadeShort    = false
+bool endedThisBar = false
+
+// --- Manage the active range ---
+if inRange
+    matured = bar_index - rStart >= minBars
+
+    // 1) Confirm wick reversals armed on the previous bar: the follow-up candle
+    //    must close back inside the range in the reversal direction.
+    if pendUp and useWick and close < open and close <= rTop
+        fadeShort := true
+    if pendDn and useWick and close > open and close >= rBot
+        fadeLong := true
+    pendUp := false
+    pendDn := false
+
+    // 2) A decisive close beyond the boundary (plus buffer) resolves the range.
+    if close > rTop + buffer
+        breakUp      := useBreak and matured
+        endedThisBar := true
+        inRange      := false
+        box.set_border_color(rBox, colUp)
+        box.set_bgcolor(rBox, color.new(colUp, fillTr))
+    else if close < rBot - buffer
+        breakDn      := useBreak and matured
+        endedThisBar := true
+        inRange      := false
+        box.set_border_color(rBox, colDn)
+        box.set_bgcolor(rBox, color.new(colDn, fillTr))
+    else
+        // 3) Boundary interaction: a qualifying rejected probe arms a wick-reversal;
+        //    otherwise the box breathes, absorbing new extremes up to the width cap.
+        if high > rTop
+            if matured and close <= rTop and high - rTop >= atr * wickMult
+                pendUp := true
+            else if math.max(rTop, high) - rBot <= maxWidth
+                rTop := high
+        if low < rBot
+            if matured and close >= rBot and rBot - low >= atr * wickMult
+                pendDn := true
+            else if rTop - math.min(rBot, low) <= maxWidth
+                rBot := low
+
+        // 4) Abandon stale ranges that never resolved.
+        if maxBars > 0 and bar_index - rStart >= maxBars
+            endedThisBar := true
+            inRange      := false
+            box.set_border_color(rBox, colStale)
+            box.set_bgcolor(rBox, color.new(colStale, fillTr))
+
+    // Keep the drawings glued to the evolving boundaries.
+    box.set_right(rBox, bar_index)
+    box.set_top(rBox, rTop)
+    box.set_bottom(rBox, rBot)
+    if not na(rMid)
+        line.set_x2(rMid, bar_index)
+        line.set_y1(rMid, math.avg(rTop, rBot))
+        line.set_y2(rMid, math.avg(rTop, rBot))
+
+// --- Detect a fresh consolidation (skip the bar a range just resolved on) ---
+if not inRange and isTight and not endedThisBar
+    inRange  := true
+    newRange := true
+    rTop     := hh
+    rBot     := ll
+    rStart   := bar_index
+    pendUp   := false
+    pendDn   := false
+    startBar = math.max(bar_index - lookback + 1, 0)
+    rBox := box.new(startBar, rTop, bar_index, rBot, border_color=colBox, border_width=1, bgcolor=color.new(colBox, fillTr))
+    rMid := showMid ? line.new(startBar, math.avg(rTop, rBot), bar_index, math.avg(rTop, rBot), color=color.new(colBox, 30), style=line.style_dashed) : na
+
+// --- Signal markers ---
+plotshape(breakUp, "Breakout Long", style=shape.triangleup, location=location.belowbar, color=colUp, size=size.small, text="BO")
+plotshape(breakDn, "Breakout Short", style=shape.triangledown, location=location.abovebar, color=colDn, size=size.small, text="BO")
+plotshape(fadeLong, "Wick Reversal Long", style=shape.diamond, location=location.belowbar, color=colUp, size=size.tiny, text="Fade")
+plotshape(fadeShort, "Wick Reversal Short", style=shape.diamond, location=location.abovebar, color=colDn, size=size.tiny, text="Fade")
+
+// --- Alerts ---
+alertcondition(newRange, "Range Breaker: New Range", "A new consolidation range has been detected")
+alertcondition(breakUp, "Range Breaker: Breakout Long", "Momentum breakout above the range")
+alertcondition(breakDn, "Range Breaker: Breakout Short", "Momentum breakdown below the range")
+alertcondition(fadeLong, "Range Breaker: Wick Reversal Long", "Failed breakdown confirmed — potential reversal toward the midline")
+alertcondition(fadeShort, "Range Breaker: Wick Reversal Short", "Failed breakout confirmed — potential reversal toward the midline")
