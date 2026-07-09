@@ -1,72 +1,104 @@
 //@version=6
-indicator("ORB — 15 Min Opening Range", "ORB 15m", overlay=true, max_lines_count=500, max_labels_count=500)
+indicator("Multi-Session ORB — Opening Range Breakout", "ORB Multi", overlay=true, max_lines_count=500, max_labels_count=500)
 
-// --- Inputs ---
-orbSession = input.session("0930-0945", "Opening Range Window", group="Opening Range", tooltip="The 15-minute opening range window. Use a chart timeframe of 15 minutes or lower so the range is measured accurately.")
-tzName     = input.string("America/New_York", "Timezone", group="Opening Range", tooltip="IANA timezone used to interpret the window above, e.g. America/New_York, Europe/London, Asia/Tokyo.")
-
+// --- General inputs ---
+tzName    = input.string("America/New_York", "Timezone", group="General", tooltip="IANA timezone used to interpret every session window below, e.g. America/New_York, Europe/London, Asia/Tokyo. Use a chart timeframe at or below the window length (e.g. 15 min or lower for a 15-minute range) so the range is measured accurately.")
 highCol   = input.color(color.new(color.green, 0), "High Line", group="Appearance")
 lowCol    = input.color(color.new(color.red, 0), "Low Line", group="Appearance")
 midCol    = input.color(color.new(color.orange, 0), "Midpoint Line", group="Appearance")
 lineW     = input.int(2, "Line Width", minval=1, maxval=4, group="Appearance")
 labelSize = input.string(size.small, "Label Size", options=[size.tiny, size.small, size.normal, size.large], group="Appearance")
 
-// --- Opening range detection ---
-inRange    = not na(time(timeframe.period, orbSession, tzName))
-rangeStart = inRange and not inRange[1]
-rangeEnd   = not inRange and inRange[1]
+// --- Session inputs ---
+s1On   = input.bool(true, "Enable", group="Session 1", inline="s1")
+s1Name = input.string("NY Open", "", group="Session 1", inline="s1")
+s1Sess = input.session("0930-0945", "Window", group="Session 1")
 
-var float orbHigh   = na
-var float orbLow    = na
-var int   startBar  = na
-var bool  rangeDone = false
+s2On   = input.bool(false, "Enable", group="Session 2", inline="s2")
+s2Name = input.string("London Open", "", group="Session 2", inline="s2")
+s2Sess = input.session("0300-0315", "Window", group="Session 2")
 
-var line  hiLine  = na
-var line  loLine  = na
-var line  midLine = na
-var label hiLabel  = na
-var label loLabel  = na
-var label midLabel = na
+s3On   = input.bool(false, "Enable", group="Session 3", inline="s3")
+s3Name = input.string("Asia Open", "", group="Session 3", inline="s3")
+s3Sess = input.session("1800-1815", "Window", group="Session 3")
 
-// New session: reset the range and freeze yesterday's lines where they ended
-if rangeStart
-    orbHigh   := high
-    orbLow    := low
-    startBar  := bar_index
-    rangeDone := false
-    hiLine  := na
-    loLine  := na
-    midLine := na
-    hiLabel  := na
-    loLabel  := na
-    midLabel := na
-else if inRange
-    orbHigh := math.max(orbHigh, high)
-    orbLow  := math.min(orbLow, low)
+s4On   = input.bool(false, "Enable", group="Session 4", inline="s4")
+s4Name = input.string("Power Hour", "", group="Session 4", inline="s4")
+s4Sess = input.session("1500-1515", "Window", group="Session 4")
 
-// Range complete: draw high, low, and midpoint lines with price labels at their ends
-if rangeEnd and not na(orbHigh)
-    rangeDone := true
-    float orbMid = (orbHigh + orbLow) / 2
-    hiLine  := line.new(startBar, orbHigh, bar_index, orbHigh, color=highCol, width=lineW, style=line.style_solid)
-    loLine  := line.new(startBar, orbLow,  bar_index, orbLow,  color=lowCol,  width=lineW, style=line.style_solid)
-    midLine := line.new(startBar, orbMid,  bar_index, orbMid,  color=midCol,  width=lineW, style=line.style_solid)
-    hiLabel  := label.new(bar_index, orbHigh, "ORB High " + str.tostring(orbHigh, format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=highCol, size=labelSize)
-    loLabel  := label.new(bar_index, orbLow,  "ORB Low "  + str.tostring(orbLow,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=lowCol,  size=labelSize)
-    midLabel := label.new(bar_index, orbMid,  "ORB Mid "  + str.tostring(orbMid,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=midCol,  size=labelSize)
+// --- ORB engine: tracks one session's opening range, draws its lines/labels, returns breakout signals ---
+orb(simple bool enabled, simple string sess, simple string name) =>
+    bool inWindow  = not na(time(timeframe.period, sess, tzName))
+    bool inRange   = enabled and inWindow
+    bool rangeStart = inRange and not inRange[1]
+    bool rangeEnd   = not inRange and inRange[1]
 
-// Extend the lines (and keep the labels at their ends) until the next opening range begins
-if not inRange and not na(hiLine)
-    line.set_x2(hiLine, bar_index)
-    line.set_x2(loLine, bar_index)
-    line.set_x2(midLine, bar_index)
-    label.set_x(hiLabel, bar_index)
-    label.set_x(loLabel, bar_index)
-    label.set_x(midLabel, bar_index)
+    var float orbHigh   = na
+    var float orbLow    = na
+    var int   startBar  = na
+    var bool  rangeDone = false
+
+    var line  hiLine  = na
+    var line  loLine  = na
+    var line  midLine = na
+    var label hiLabel  = na
+    var label loLabel  = na
+    var label midLabel = na
+
+    // New session: reset the range and freeze the previous day's lines where they ended
+    if rangeStart
+        orbHigh   := high
+        orbLow    := low
+        startBar  := bar_index
+        rangeDone := false
+        hiLine  := na
+        loLine  := na
+        midLine := na
+        hiLabel  := na
+        loLabel  := na
+        midLabel := na
+    else if inRange
+        orbHigh := math.max(orbHigh, high)
+        orbLow  := math.min(orbLow, low)
+
+    // Range complete: draw high, low, and midpoint lines with price labels at their ends
+    if rangeEnd and not na(orbHigh)
+        rangeDone := true
+        float orbMid = (orbHigh + orbLow) / 2
+        hiLine  := line.new(startBar, orbHigh, bar_index, orbHigh, color=highCol, width=lineW, style=line.style_solid)
+        loLine  := line.new(startBar, orbLow,  bar_index, orbLow,  color=lowCol,  width=lineW, style=line.style_solid)
+        midLine := line.new(startBar, orbMid,  bar_index, orbMid,  color=midCol,  width=lineW, style=line.style_solid)
+        hiLabel  := label.new(bar_index, orbHigh, name + " High " + str.tostring(orbHigh, format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=highCol, size=labelSize)
+        loLabel  := label.new(bar_index, orbLow,  name + " Low "  + str.tostring(orbLow,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=lowCol,  size=labelSize)
+        midLabel := label.new(bar_index, orbMid,  name + " Mid "  + str.tostring(orbMid,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=midCol,  size=labelSize)
+
+    // Extend the lines (and keep the labels at their ends) until this session's next opening range begins
+    if not inRange and not na(hiLine)
+        line.set_x2(hiLine, bar_index)
+        line.set_x2(loLine, bar_index)
+        line.set_x2(midLine, bar_index)
+        label.set_x(hiLabel, bar_index)
+        label.set_x(loLabel, bar_index)
+        label.set_x(midLabel, bar_index)
+
+    bool brokeHigh = rangeDone and ta.crossover(close, orbHigh)
+    bool brokeLow  = rangeDone and ta.crossunder(close, orbLow)
+    [brokeHigh, brokeLow]
+
+// --- Run each configured session ---
+[s1BrokeHigh, s1BrokeLow] = orb(s1On, s1Sess, s1Name)
+[s2BrokeHigh, s2BrokeLow] = orb(s2On, s2Sess, s2Name)
+[s3BrokeHigh, s3BrokeLow] = orb(s3On, s3Sess, s3Name)
+[s4BrokeHigh, s4BrokeLow] = orb(s4On, s4Sess, s4Name)
 
 // --- Breakout alerts ---
-brokeHigh = rangeDone and ta.crossover(close, orbHigh)
-brokeLow  = rangeDone and ta.crossunder(close, orbLow)
-
-alertcondition(brokeHigh, "ORB High Break", "Price broke above the opening range high")
-alertcondition(brokeLow, "ORB Low Break", "Price broke below the opening range low")
+alertcondition(s1BrokeHigh, "Session 1 High Break", "Price broke above the Session 1 opening range high")
+alertcondition(s1BrokeLow,  "Session 1 Low Break",  "Price broke below the Session 1 opening range low")
+alertcondition(s2BrokeHigh, "Session 2 High Break", "Price broke above the Session 2 opening range high")
+alertcondition(s2BrokeLow,  "Session 2 Low Break",  "Price broke below the Session 2 opening range low")
+alertcondition(s3BrokeHigh, "Session 3 High Break", "Price broke above the Session 3 opening range high")
+alertcondition(s3BrokeLow,  "Session 3 Low Break",  "Price broke below the Session 3 opening range low")
+alertcondition(s4BrokeHigh, "Session 4 High Break", "Price broke above the Session 4 opening range high")
+alertcondition(s4BrokeLow,  "Session 4 Low Break",  "Price broke below the Session 4 opening range low")
+alertcondition(s1BrokeHigh or s2BrokeHigh or s3BrokeHigh or s4BrokeHigh, "Any ORB High Break", "Price broke above an opening range high")
+alertcondition(s1BrokeLow or s2BrokeLow or s3BrokeLow or s4BrokeLow,   "Any ORB Low Break",  "Price broke below an opening range low")
