@@ -1,0 +1,239 @@
+//@version=6
+indicator("Pivot Hunter Pro [MOT]", shorttitle="Pivot Hunter Pro", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Pivot Hunter Pro — dynamic support/resistance with a full level lifecycle:
+//  slope-based detection, internal path validation, spacing filter, wick
+//  adjustment on false breakouts, close-based invalidation, dominant-level
+//  re-scan on expiry, and buffered breakout signals.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── Inputs ─────────────────────────────────────────────────────────────────
+grpWin = "Levels Window & Spacing"
+clearAfterBars   = input.int(60, "Clear Levels After (bars)", minval=10, group=grpWin, tooltip="Levels expire after this many bars. On expiry the window is re-scanned and the single most dominant high/low from the period is plotted as a new level.")
+minSpacing       = input.float(20.0, "Minimum Level Spacing (price units)", minval=0.0, group=grpWin, tooltip="A new level is only drawn if it is at least this far from every existing level, and if no minor swing sits within this distance on the breakout side of the level (the path beyond the level must be clear).")
+invalidateCloses = input.int(3, "Invalidate After (consecutive closes)", minval=1, group=grpWin, tooltip="A level is removed once price closes beyond it for this many consecutive bars.")
+
+grpStyle = "Lines & Price Label Styling"
+resColor      = input.color(#f23645, "Resistance Line Color", group=grpStyle)
+supColor      = input.color(#089981, "Support Line Color", group=grpStyle)
+levelWidth    = input.int(2, "Level Line Width (px)", minval=1, maxval=5, group=grpStyle)
+lblOffsetBars = input.int(25, "Price Label X Offset (bars)", minval=0, maxval=400, group=grpStyle)
+lblTextColor  = input.color(color.white, "Price Label Text Color", group=grpStyle)
+priceLblSize  = input.string("Small", "Price Label Size", options=["Tiny", "Small", "Normal", "Large"], group=grpStyle)
+
+grpSig = "Breakout Signals"
+showSignals   = input.bool(true, "Show Breakout Signal Labels", group=grpSig)
+sigLblSize    = input.string("Small", "Signal Label Size", options=["Tiny", "Small", "Normal", "Large"], group=grpSig)
+breakBuffer   = input.float(5.0, "Breakout Buffer (points)", minval=0.0, group=grpSig, tooltip="Price must clear the level by this many extra points before the breakout is considered valid. Filters out minor breaches.")
+sigUpColor    = input.color(#089981, "Signal Up Color", group=grpSig)
+sigDownColor  = input.color(#f23645, "Signal Down Color", group=grpSig)
+sigUpType     = input.string("▲", "Breakout Up Signal Type (preset/custom)", options=["▲", "△", "●", "↑", "Custom"], group=grpSig)
+sigUpCustom   = input.string("🟢", "Custom Up Text", group=grpSig, tooltip="Used when the up signal type is set to Custom.")
+sigDownType   = input.string("▼", "Breakout Down Signal Type (preset/custom)", options=["▼", "▽", "●", "↓", "Custom"], group=grpSig)
+sigDownCustom = input.string("🔴", "Custom Down Text", group=grpSig, tooltip="Used when the down signal type is set to Custom.")
+
+grpRun = "Runtime Behavior"
+backtestMode = input.bool(true, "Backtest Mode (show all historical signals)", group=grpRun, tooltip="Keep every historical breakout label on the chart, for strategy review and Bar Replay. When off, only the most recent up and down signals are kept.")
+
+// ─── Constants & helpers ─────────────────────────────────────────────────────
+int SLOPE_LEN = 2  // consecutive higher highs / lower lows required before a turn qualifies as a major pivot
+
+f_size(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : size.large
+
+// A plotted level and its lifecycle state
+type Level
+    line  ln
+    label lbl
+    float price
+    int   createdBar
+    int   closeRun
+
+// ─── State ───────────────────────────────────────────────────────────────────
+var array<Level> resLevels = array.new<Level>()
+var array<Level> supLevels = array.new<Level>()
+
+// Minor "temporary" swing points recorded since the last major level (per side)
+var array<float> tmpResP = array.new<float>()
+var array<int>   tmpResB = array.new<int>()
+var array<float> tmpSupP = array.new<float>()
+var array<int>   tmpSupB = array.new<int>()
+
+f_purgeOld(array<float> prices, array<int> bars) =>
+    while array.size(bars) > 0 and bar_index - array.get(bars, 0) > clearAfterBars
+        array.shift(prices)
+        array.shift(bars)
+
+// Spacing filter: candidate must sit at least minSpacing away from every existing level
+f_spaced(float price) =>
+    bool ok = true
+    for lv in resLevels
+        if math.abs(price - lv.price) < minSpacing
+            ok := false
+    for lv in supLevels
+        if math.abs(price - lv.price) < minSpacing
+            ok := false
+    ok
+
+// Internal path validation: no minor resistance hiding just above a new resistance
+f_pathClearUp(float price) =>
+    bool ok = true
+    for t in tmpResP
+        if t > price and t - price < minSpacing
+            ok := false
+    ok
+
+// Internal path validation: no minor support hiding just below a new support
+f_pathClearDown(float price) =>
+    bool ok = true
+    for t in tmpSupP
+        if t < price and price - t < minSpacing
+            ok := false
+    ok
+
+f_makeLevel(float price, int startBar, bool isRes) =>
+    color col = isRes ? resColor : supColor
+    line ln = line.new(startBar, price, bar_index, price, xloc.bar_index, extend.right, col, line.style_solid, levelWidth)
+    label lbl = label.new(bar_index + lblOffsetBars, price, str.tostring(price, format.mintick), xloc.bar_index, yloc.price, color(na), label.style_none, lblTextColor, f_size(priceLblSize))
+    Level.new(ln, lbl, price, bar_index, 0)
+
+f_kill(Level lv) =>
+    line.delete(lv.ln)
+    label.delete(lv.lbl)
+
+// ─── Level management (breakouts, adjustment, invalidation, expiry) ──────────
+bool breakUpEvent   = false
+bool breakDownEvent = false
+bool resExpired     = false
+bool supExpired     = false
+
+if array.size(resLevels) > 0
+    for i = array.size(resLevels) - 1 to 0
+        Level lv = array.get(resLevels, i)
+        bool drop = false
+        if high > lv.price + breakBuffer
+            // Confirmed breakout beyond level + buffer: signal and remove the line
+            breakUpEvent := true
+            drop := true
+        else
+            if high > lv.price and close <= lv.price
+                // False breakout: wick poked through but failed to close beyond.
+                // Adjust (strengthen) the level up to the new rejection point.
+                lv.price := high
+                line.set_y1(lv.ln, lv.price)
+                line.set_y2(lv.ln, lv.price)
+                label.set_y(lv.lbl, lv.price)
+                label.set_text(lv.lbl, str.tostring(lv.price, format.mintick))
+            lv.closeRun := close > lv.price ? lv.closeRun + 1 : 0
+            if lv.closeRun >= invalidateCloses
+                // Level no longer respected: price has closed above it repeatedly
+                drop := true
+            else if bar_index - lv.createdBar >= clearAfterBars
+                drop := true
+                resExpired := true
+        if drop
+            f_kill(lv)
+            array.remove(resLevels, i)
+        else
+            label.set_x(lv.lbl, bar_index + lblOffsetBars)
+
+if array.size(supLevels) > 0
+    for i = array.size(supLevels) - 1 to 0
+        Level lv = array.get(supLevels, i)
+        bool drop = false
+        if low < lv.price - breakBuffer
+            breakDownEvent := true
+            drop := true
+        else
+            if low < lv.price and close >= lv.price
+                lv.price := low
+                line.set_y1(lv.ln, lv.price)
+                line.set_y2(lv.ln, lv.price)
+                label.set_y(lv.lbl, lv.price)
+                label.set_text(lv.lbl, str.tostring(lv.price, format.mintick))
+            lv.closeRun := close < lv.price ? lv.closeRun + 1 : 0
+            if lv.closeRun >= invalidateCloses
+                drop := true
+            else if bar_index - lv.createdBar >= clearAfterBars
+                drop := true
+                supExpired := true
+        if drop
+            f_kill(lv)
+            array.remove(supLevels, i)
+        else
+            label.set_x(lv.lbl, bar_index + lblOffsetBars)
+
+// ─── Detection: price action slope analysis ──────────────────────────────────
+var int hhRun = 0
+var int llRun = 0
+int hhPrev = hhRun  // run length as of the previous bar
+int llPrev = llRun
+hhRun := high > high[1] ? hhRun + 1 : 0
+llRun := low < low[1] ? llRun + 1 : 0
+
+f_purgeOld(tmpResP, tmpResB)
+f_purgeOld(tmpSupP, tmpSupB)
+
+// A lower high after a series of higher highs marks a potential resistance at the peak
+bool localHigh    = high < high[1] and hhPrev >= 1
+bool majorResCand = high < high[1] and hhPrev >= SLOPE_LEN
+if localHigh
+    float cand = high[1]
+    if majorResCand and f_spaced(cand) and f_pathClearUp(cand)
+        array.push(resLevels, f_makeLevel(cand, bar_index - 1, true))
+        array.clear(tmpResP)
+        array.clear(tmpResB)
+    else
+        // Rejected or minor swing: remember it for internal path validation
+        array.push(tmpResP, cand)
+        array.push(tmpResB, bar_index - 1)
+
+// A higher low after a series of lower lows marks a potential support at the trough
+bool localLow     = low > low[1] and llPrev >= 1
+bool majorSupCand = low > low[1] and llPrev >= SLOPE_LEN
+if localLow
+    float cand = low[1]
+    if majorSupCand and f_spaced(cand) and f_pathClearDown(cand)
+        array.push(supLevels, f_makeLevel(cand, bar_index - 1, false))
+        array.clear(tmpSupP)
+        array.clear(tmpSupB)
+    else
+        array.push(tmpSupP, cand)
+        array.push(tmpSupB, bar_index - 1)
+
+// ─── Dominant level re-scan on expiry ────────────────────────────────────────
+float domHigh    = ta.highest(high, clearAfterBars)
+int   domHighBar = bar_index + ta.highestbars(high, clearAfterBars)
+float domLow     = ta.lowest(low, clearAfterBars)
+int   domLowBar  = bar_index + ta.lowestbars(low, clearAfterBars)
+
+if resExpired and f_spaced(domHigh)
+    array.push(resLevels, f_makeLevel(domHigh, domHighBar, true))
+    array.clear(tmpResP)
+    array.clear(tmpResB)
+
+if supExpired and f_spaced(domLow)
+    array.push(supLevels, f_makeLevel(domLow, domLowBar, false))
+    array.clear(tmpSupP)
+    array.clear(tmpSupB)
+
+// ─── Breakout signal labels ──────────────────────────────────────────────────
+var label lastUpLbl   = na
+var label lastDownLbl = na
+
+if breakUpEvent and showSignals
+    if not backtestMode and not na(lastUpLbl)
+        label.delete(lastUpLbl)
+    string txt = sigUpType == "Custom" ? sigUpCustom : sigUpType
+    lastUpLbl := label.new(bar_index, na, txt, xloc.bar_index, yloc.belowbar, color(na), label.style_none, sigUpColor, f_size(sigLblSize))
+
+if breakDownEvent and showSignals
+    if not backtestMode and not na(lastDownLbl)
+        label.delete(lastDownLbl)
+    string txt = sigDownType == "Custom" ? sigDownCustom : sigDownType
+    lastDownLbl := label.new(bar_index, na, txt, xloc.bar_index, yloc.abovebar, color(na), label.style_none, sigDownColor, f_size(sigLblSize))
+
+// ─── Alerts ──────────────────────────────────────────────────────────────────
+alertcondition(breakUpEvent, "Pivot Hunter Pro — Break UP", "Price broke above a resistance level plus the buffer")
+alertcondition(breakDownEvent, "Pivot Hunter Pro — Break DOWN", "Price broke below a support level minus the buffer")
