@@ -1,66 +1,97 @@
 //@version=6
 // ─────────────────────────────────────────────────────────────────────────────
-// RANGE BREAKER — Adaptive Volatility Boxes
+// RANGE BREAKER  (MOT-style rebuild)
 //
-// Detects volatility compression (consolidation) by comparing the lookback
-// high/low span against ATR, draws a dynamically expanding range box, and
-// signals momentum breakouts and confirmed wick reversals.
+// Detects low-volatility consolidation zones and signals when the market
+// transitions into expansion. Ranges are found by comparing the high/low span
+// of the last N bars against ATR; active boxes "breathe" (expand) with the
+// churn, then resolve on a validated breakout or flag failed probes (fakeouts)
+// for mean-reversion back to the midline.
 //
-// HOW TO USE
-//  • Pick a Preset Profile that matches your style — every internal parameter
-//    (lookback, tightness, range lifetime) is tuned automatically.
-//  • Breakout & Retest: conservative traders can wait for a pullback to the
-//    box edge or midline after a breakout signal before entering.
-//  • Enable "Confirm Breakouts with Volume Spike" to filter low-volume
-//    fakeouts; in choppy markets trade Wick Reversals back toward the midline.
+//  • Adjustable range sensitivity (min bars, ATR threshold)
+//  • Breakout validation: buffer + optional pattern & volume confirmation
+//  • Cooldown logic to avoid repeated signals in chop
+//  • Persistent tracking of recent valid ranges + extended retest levels
+//  • Signal labels with full styling control
 // ─────────────────────────────────────────────────────────────────────────────
-indicator("Range Breaker — Adaptive Volatility Boxes", "Range Breaker", overlay=true, max_boxes_count=250, max_lines_count=250, max_labels_count=500)
+indicator("Range Breaker", "Range Breaker", overlay=true, max_boxes_count=100, max_lines_count=300, max_labels_count=300)
 
-// --- Settings ---
-profile    = input.string("Normal Ranges", "Preset Profile", options=["Tight Ranges", "Normal Ranges", "Swing Trading", "Options Selling", "Custom"], tooltip="• Tight Ranges — scalping on lower timeframes.\n• Normal Ranges — balanced default for intraday and short-term swings.\n• Swing Trading — looser parameters for multi-day consolidations.\n• Options Selling — long, sideways chop ideal for theta strategies.\n• Custom — uses the two settings below.")
-lookbackIn = input.int(20, "Custom: Lookback", minval=5, tooltip="Only used when Preset Profile is Custom. Bars over which the high/low span is tested for compression.")
-tightIn    = input.float(2.0, "Custom: Tightness (× ATR)", minval=0.5, step=0.1, tooltip="Only used when Preset Profile is Custom. A range is detected when the lookback span is smaller than ATR × this value. Raise it to detect ranges more often.")
+// --- Inputs: Range Engine ---
+grpE = "Range Engine"
+rangeLen = input.int(15, "Minimum Range Length (bars)", minval=5, group=grpE, tooltip="A range is detected when the high/low span of this many bars compresses below the ATR threshold.")
+atrLen   = input.int(14, "ATR Length", minval=1, group=grpE)
+atrMult  = input.float(2.0, "Range Sensitivity (× ATR)", minval=0.5, step=0.1, group=grpE, tooltip="The span must be smaller than ATR × this value to qualify as a range. Higher = more ranges detected.")
+cooldown = input.int(5, "Cooldown After Resolution (bars)", minval=0, group=grpE, tooltip="Fail-safe: bars to wait after a range resolves before a new one can form, preventing repeated signals in choppy conditions.")
+keepN    = input.int(10, "Recent Ranges to Keep", minval=1, maxval=50, group=grpE, tooltip="Older range drawings beyond this count are removed from the chart.")
 
-grpS = "Signals"
-showBO   = input.bool(true, "Breakout Signals", group=grpS)
-showWick = input.bool(true, "Wick Reversal Signals", group=grpS)
-useVol   = input.bool(false, "Confirm Breakouts with Volume Spike", group=grpS, tooltip="Recommended. Breakout signals only fire when the breakout candle's volume exceeds the 20-bar average by the multiple below, filtering fakeouts that lack participation.")
-volMult  = input.float(1.7, "Volume Spike Multiple", minval=1.0, step=0.1, group=grpS)
+// --- Inputs: Breakout Validation ---
+grpB = "Breakout Validation"
+bufMult    = input.float(0.10, "Breakout Buffer (× ATR)", minval=0.0, step=0.05, group=grpB, tooltip="The close must clear the box boundary by this ATR fraction.")
+usePattern = input.bool(true, "Pattern Confirmation", group=grpB, tooltip="The breakout candle must be strong-bodied (body ≥ 50% of its full height) and close in the breakout direction — filters weak, indecisive breaks.")
+useVol     = input.bool(false, "Volume Spike Confirmation", group=grpB, tooltip="Breakout volume must exceed the 20-bar average by the multiple below — filters fakeouts that lack participation.")
+volMult    = input.float(1.7, "Volume Spike Multiple", minval=1.0, step=0.1, group=grpB)
+showLevels = input.bool(true, "Extend Broken Range Levels", group=grpB, tooltip="After a breakout, projects the range top/bottom to the right as retest guides.")
 
-grpV = "Appearance"
-colBox  = input.color(color.new(color.blue, 0), "Active Range", group=grpV)
-colUp   = input.color(color.new(color.green, 0), "Bullish Breakout", group=grpV)
-colDn   = input.color(color.new(color.red, 0), "Bearish Breakout", group=grpV)
-showMid = input.bool(true, "Show Midline", group=grpV)
+// --- Inputs: Signal Labels ---
+grpL = "Signal Labels"
+showBreak = input.bool(true, "Breakout Labels", group=grpL)
+showFake  = input.bool(true, "Fakeout / Reversal Labels", group=grpL)
+labelSize = input.string(size.small, "Label Size", options=[size.tiny, size.small, size.normal, size.large], group=grpL)
+bullCol   = input.color(#089981, "Bullish", group=grpL)
+bearCol   = input.color(#f23645, "Bearish", group=grpL)
+txtCol    = input.color(color.white, "Label Text", group=grpL)
 
-// --- Profile parameters (lookback, tightness, expansion cap, min age, max age) ---
-isTightP  = profile == "Tight Ranges"
-isNormalP = profile == "Normal Ranges"
-isSwingP  = profile == "Swing Trading"
-isThetaP  = profile == "Options Selling"
-lookback   = isTightP ? 10   : isNormalP ? 20   : isSwingP ? 40   : isThetaP ? 60   : lookbackIn
-tightMult  = isTightP ? 1.5  : isNormalP ? 2.0  : isSwingP ? 2.5  : isThetaP ? 3.0  : tightIn
-expandMult = isTightP ? 1.20 : isNormalP ? 1.25 : isSwingP ? 1.30 : isThetaP ? 1.40 : 1.25
-minBars    = isTightP ? 3    : isNormalP ? 5    : isSwingP ? 8    : isThetaP ? 12   : 5
-maxBars    = isTightP ? 100  : isNormalP ? 200  : isSwingP ? 400  : isThetaP ? 600  : 200
+// --- Inputs: Range Style ---
+grpR = "Range Style"
+boxCol  = input.color(#787b86, "Range Color", group=grpR)
+showMid = input.bool(true, "Midline", group=grpR)
+showTag = input.bool(true, "\"Range\" Text Inside Box", group=grpR)
 
-// --- Fixed internals ---
-ATR_LEN  = 14   // volatility reference length
-BUF_MULT = 0.10 // close must clear the boundary by this ATR fraction to break out
-WICK_MIN = 0.25 // a probe must poke this ATR fraction beyond the boundary to arm a reversal
-VOL_LEN  = 20   // volume average length for the spike filter
-FILL_TR  = 90   // box fill transparency
-colStale = color.gray
+// --- Engine internals ---
+EXPAND   = 1.25 // how far an active box may stretch, relative to the detection threshold
+WICK_MIN = 0.25 // a probe must poke this ATR fraction beyond the boundary to arm a fakeout
+VOL_LEN  = 20   // volume average length
+STALE    = 500  // ranges older than this are abandoned
+FILL_TR  = 88   // box fill transparency
 
-// --- Volatility compression filter ---
-atr = ta.atr(ATR_LEN)
-hh  = ta.highest(high, lookback)
-ll  = ta.lowest(low, lookback)
-isTight = not na(atr) and (hh - ll) < atr * tightMult
+// --- Calculations ---
+atr = ta.atr(atrLen)
+hh  = ta.highest(high, rangeLen)
+ll  = ta.lowest(low, rangeLen)
+compressed = not na(atr) and (hh - ll) < atr * atrMult
 
-buffer   = atr * BUF_MULT
-maxWidth = atr * tightMult * expandMult
+buffer   = atr * bufMult
+maxWidth = atr * atrMult * EXPAND
 volSpike = volume > ta.sma(volume, VOL_LEN) * volMult
+body     = math.abs(close - open)
+strongUp = close > open and (high == low or body >= (high - low) * 0.5)
+strongDn = close < open and (high == low or body >= (high - low) * 0.5)
+
+// --- Persistent tracking of recent ranges (auto-pruned drawings) ---
+var array<box>   boxesA = array.new<box>()
+var array<line>  midsA  = array.new<line>()
+var array<line>  lvlsA  = array.new<line>()
+var array<label> labsA  = array.new<label>()
+
+f_keep_box(box b) =>
+    array.push(boxesA, b)
+    if array.size(boxesA) > keepN
+        box.delete(array.shift(boxesA))
+
+f_keep_mid(line l) =>
+    array.push(midsA, l)
+    if array.size(midsA) > keepN
+        line.delete(array.shift(midsA))
+
+f_keep_lvl(line l) =>
+    array.push(lvlsA, l)
+    if array.size(lvlsA) > 2 * keepN
+        line.delete(array.shift(lvlsA))
+
+f_keep_lab(label l) =>
+    array.push(labsA, l)
+    if array.size(labsA) > 6 * keepN
+        label.delete(array.shift(labsA))
 
 // --- Range state ---
 var bool  inRange = false
@@ -71,20 +102,18 @@ var box   rBox    = na
 var line  rMid    = na
 var bool  pendUp  = false // wick probed above the box last bar; awaiting confirmation
 var bool  pendDn  = false // wick probed below the box last bar; awaiting confirmation
+var int   lastEnd = -1000000
 
-bool newRange     = false
-bool rawBreakUp   = false // matured breakout close, before volume filtering
-bool rawBreakDn   = false
-bool fadeLong     = false
-bool fadeShort    = false
-bool endedThisBar = false
+bool newRange  = false
+bool breakUp   = false // validated breakout (buffer + enabled confirmations)
+bool breakDn   = false
+bool fadeLong  = false // confirmed fakeout below → reversal toward the midline
+bool fadeShort = false // confirmed fakeout above
 
 // --- Manage the active range ---
 if inRange
-    matured = bar_index - rStart >= minBars
-
-    // 1) Confirm wick reversals armed on the previous bar: the follow-up candle
-    //    must close back inside the range in the reversal direction.
+    // 1) Confirm fakeouts armed on the previous bar: the follow-up candle must
+    //    close back inside the range in the reversal direction.
     if pendUp and close < open and close <= rTop
         fadeShort := true
     if pendDn and close > open and close >= rBot
@@ -92,39 +121,45 @@ if inRange
     pendUp := false
     pendDn := false
 
-    // 2) A decisive close beyond the boundary (plus buffer) resolves the range.
+    // 2) A close beyond the boundary (plus buffer) resolves the range; the
+    //    signal itself must also pass the enabled confirmations.
+    volOK = not useVol or volSpike
     if close > rTop + buffer
-        rawBreakUp   := matured
-        endedThisBar := true
-        inRange      := false
-        box.set_border_color(rBox, colUp)
-        box.set_bgcolor(rBox, color.new(colUp, FILL_TR))
+        breakUp := volOK and (not usePattern or strongUp)
+        inRange := false
+        lastEnd := bar_index
+        box.set_border_color(rBox, bullCol)
+        box.set_bgcolor(rBox, color.new(bullCol, FILL_TR))
+        if showLevels
+            f_keep_lvl(line.new(bar_index, rTop, bar_index + 1, rTop, extend=extend.right, color=bullCol, style=line.style_dotted))
+            f_keep_lvl(line.new(bar_index, rBot, bar_index + 1, rBot, extend=extend.right, color=color.new(boxCol, 40), style=line.style_dotted))
     else if close < rBot - buffer
-        rawBreakDn   := matured
-        endedThisBar := true
-        inRange      := false
-        box.set_border_color(rBox, colDn)
-        box.set_bgcolor(rBox, color.new(colDn, FILL_TR))
+        breakDn := volOK and (not usePattern or strongDn)
+        inRange := false
+        lastEnd := bar_index
+        box.set_border_color(rBox, bearCol)
+        box.set_bgcolor(rBox, color.new(bearCol, FILL_TR))
+        if showLevels
+            f_keep_lvl(line.new(bar_index, rBot, bar_index + 1, rBot, extend=extend.right, color=bearCol, style=line.style_dotted))
+            f_keep_lvl(line.new(bar_index, rTop, bar_index + 1, rTop, extend=extend.right, color=color.new(boxCol, 40), style=line.style_dotted))
     else
-        // 3) Boundary interaction: a qualifying rejected probe arms a wick-reversal;
-        //    otherwise the box breathes, absorbing new extremes up to the width cap.
+        // 3) Boundary interaction: a qualifying rejected probe arms a fakeout;
+        //    otherwise the box breathes, absorbing new extremes up to a cap.
         if high > rTop
-            if matured and close <= rTop and high - rTop >= atr * WICK_MIN
+            if close <= rTop and high - rTop >= atr * WICK_MIN
                 pendUp := true
             else if math.max(rTop, high) - rBot <= maxWidth
                 rTop := high
         if low < rBot
-            if matured and close >= rBot and rBot - low >= atr * WICK_MIN
+            if close >= rBot and rBot - low >= atr * WICK_MIN
                 pendDn := true
             else if rTop - math.min(rBot, low) <= maxWidth
                 rBot := low
 
-        // 4) Abandon stale ranges that never resolved.
-        if maxBars > 0 and bar_index - rStart >= maxBars
-            endedThisBar := true
-            inRange      := false
-            box.set_border_color(rBox, colStale)
-            box.set_bgcolor(rBox, color.new(colStale, FILL_TR))
+        // 4) Fail-safe: abandon stale ranges that never resolved.
+        if bar_index - rStart >= STALE
+            inRange := false
+            lastEnd := bar_index
 
     // Keep the drawings glued to the evolving boundaries.
     box.set_right(rBox, bar_index)
@@ -135,8 +170,8 @@ if inRange
         line.set_y1(rMid, math.avg(rTop, rBot))
         line.set_y2(rMid, math.avg(rTop, rBot))
 
-// --- Detect a fresh consolidation (skip the bar a range just resolved on) ---
-if not inRange and isTight and not endedThisBar
+// --- Detect a fresh consolidation (respecting the cooldown) ---
+if not inRange and compressed and bar_index - lastEnd >= math.max(cooldown, 1)
     inRange  := true
     newRange := true
     rTop     := hh
@@ -144,27 +179,26 @@ if not inRange and isTight and not endedThisBar
     rStart   := bar_index
     pendUp   := false
     pendDn   := false
-    startBar = math.max(bar_index - lookback + 1, 0)
-    rBox := box.new(startBar, rTop, bar_index, rBot, border_color=colBox, border_width=2, bgcolor=color.new(colBox, FILL_TR))
+    startBar = math.max(bar_index - rangeLen + 1, 0)
+    rBox := box.new(startBar, rTop, bar_index, rBot, border_color=boxCol, border_width=2, bgcolor=color.new(boxCol, FILL_TR), text=showTag ? "Range" : "", text_color=color.new(boxCol, 20), text_size=size.tiny, text_halign=text.align_center, text_valign=text.align_top)
+    f_keep_box(rBox)
     rMid := na
     if showMid
-        rMid := line.new(startBar, math.avg(rTop, rBot), bar_index, math.avg(rTop, rBot), color=color.new(colBox, 30), style=line.style_dashed)
+        rMid := line.new(startBar, math.avg(rTop, rBot), bar_index, math.avg(rTop, rBot), color=color.new(boxCol, 30), style=line.style_dashed)
+        f_keep_mid(rMid)
 
-// --- Displayed signals (honor toggles and the volume filter) ---
-volOK    = not useVol or volSpike
-breakUp  = rawBreakUp and showBO and volOK
-breakDn  = rawBreakDn and showBO and volOK
-sigFadeL = fadeLong and showWick
-sigFadeS = fadeShort and showWick
-
-// --- Signal markers ---
-plotshape(breakUp, "Breakout Long", style=shape.triangleup, location=location.belowbar, color=colUp, size=size.small, text="BO")
-plotshape(breakDn, "Breakout Short", style=shape.triangledown, location=location.abovebar, color=colDn, size=size.small, text="BO")
-plotshape(sigFadeL, "Wick Reversal Long", style=shape.diamond, location=location.belowbar, color=colUp, size=size.tiny, text="Fade")
-plotshape(sigFadeS, "Wick Reversal Short", style=shape.diamond, location=location.abovebar, color=colDn, size=size.tiny, text="Fade")
+// --- Signal labels ---
+if breakUp and showBreak
+    f_keep_lab(label.new(bar_index, low, "Break ▲", style=label.style_label_up, color=bullCol, textcolor=txtCol, size=labelSize))
+if breakDn and showBreak
+    f_keep_lab(label.new(bar_index, high, "Break ▼", style=label.style_label_down, color=bearCol, textcolor=txtCol, size=labelSize))
+if fadeLong and showFake
+    f_keep_lab(label.new(bar_index, low, "Fakeout", style=label.style_label_up, color=color.new(bullCol, 20), textcolor=txtCol, size=labelSize))
+if fadeShort and showFake
+    f_keep_lab(label.new(bar_index, high, "Fakeout", style=label.style_label_down, color=color.new(bearCol, 20), textcolor=txtCol, size=labelSize))
 
 // --- Alerts ---
-alertcondition(newRange, "Range Detected", "Range Breaker: a new consolidation phase has begun")
-alertcondition(rawBreakUp or rawBreakDn, "Range Breakout", "Range Breaker: price closed outside the box")
-alertcondition((rawBreakUp or rawBreakDn) and volSpike, "Breakout with Volume Confirmation", "Range Breaker: breakout accompanied by a significant volume spike")
-alertcondition(fadeLong or fadeShort, "Range Reversal", "Range Breaker: confirmed wick-reversal setup — potential move back toward the midline")
+alertcondition(newRange, "Range Detected", "Range Breaker: a new consolidation range has formed")
+alertcondition(breakUp, "Breakout Up", "Range Breaker: validated breakout above the range")
+alertcondition(breakDn, "Breakout Down", "Range Breaker: validated breakdown below the range")
+alertcondition(fadeLong or fadeShort, "Fakeout Reversal", "Range Breaker: confirmed fakeout — potential reversal toward the midline")
