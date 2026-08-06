@@ -1,0 +1,226 @@
+//@version=6
+strategy("ORB Strategy — Top 5 Entry Techniques", "ORB Strat", overlay=true, initial_capital=25000, pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true, max_lines_count=500, max_labels_count=500)
+
+// --- Opening range inputs ---
+orbSession = input.session("0930-0945", "Opening Range Window", group="Opening Range", tooltip="Use a chart timeframe at or below the window length so the range is measured accurately.")
+tzName     = input.string("America/New_York", "Timezone", group="Opening Range", tooltip="IANA timezone used to interpret the session windows, e.g. America/New_York, Europe/London, Asia/Tokyo.")
+
+// --- Entry technique ---
+T1 = "1 — Breakout Close"
+T2 = "2 — Break & Retest"
+T3 = "3 — Failed Breakout Fade"
+T4 = "4 — Volume + VWAP Breakout"
+T5 = "5 — First Candle Runner"
+technique = input.string(T1, "Entry Technique", options=[T1, T2, T3, T4, T5], group="Entry", tooltip="1: enter when a candle closes beyond the range. 2: enter when price returns to the broken level and holds it. 3: enter against a breakout that closes back inside the range. 4: technique 1 plus volume and VWAP filters. 5: enter at range completion in the direction of the opening range candle (the academic ORB study used this with a 10R target).")
+allowLong  = input.bool(true, "Longs", group="Entry", inline="dir")
+allowShort = input.bool(true, "Shorts", group="Entry", inline="dir")
+oneTradePerDay = input.bool(true, "Max one trade per day per side", group="Entry")
+
+// --- Risk / reward ---
+SM_AUTO = "Auto (per technique)"
+SM_MID  = "Midpoint"
+SM_OPP  = "Opposite Side"
+stopMode   = input.string(SM_AUTO, "Stop Placement", options=[SM_AUTO, SM_MID, SM_OPP], group="Risk / Reward", tooltip="Auto: techniques 1/2/4 stop at the range midpoint, technique 3 stops beyond the failed-breakout extreme, technique 5 stops at the opposite side of the range. Technique 3 always uses its automatic stop.")
+TGT_R  = "R Multiple"
+TGT_MM = "Measured Move (range height)"
+targetMode = input.string(TGT_R, "Target Type", options=[TGT_R, TGT_MM], group="Risk / Reward")
+rrMult     = input.float(2.0, "Risk:Reward Multiple", minval=0.5, step=0.5, group="Risk / Reward", tooltip="Profit target as a multiple of the risk (entry to stop distance). Try 1.5-2 for techniques 1-4; the published study used 10 for technique 5.")
+takePartial = input.bool(false, "Take 50% at 1R + breakeven stop", group="Risk / Reward", tooltip="Scale out half the position at 1R, then move the stop to breakeven on the remainder.")
+riskPct     = input.float(1.0, "Risk % of Equity per Trade", minval=0.1, step=0.1, group="Risk / Reward")
+
+// --- Filters (technique 4) ---
+volLen  = input.int(20, "Volume Average Length", group="Filters (Technique 4)")
+volMult = input.float(1.2, "Min Volume x Average", minval=0.5, step=0.1, group="Filters (Technique 4)")
+showVwap = input.bool(false, "Plot Session VWAP", group="Filters (Technique 4)")
+
+// --- Session end ---
+eodFlat = input.bool(true, "Close all at end of day", group="Session End", inline="eod")
+eodTime = input.session("1555-1600", "", group="Session End", inline="eod", tooltip="When this window begins, all positions are closed and no new trades are taken until the next opening range.")
+
+// --- Opening range tracking ---
+inRange    = not na(time(timeframe.period, orbSession, tzName))
+rangeStart = inRange and not inRange[1]
+rangeEnd   = not inRange and inRange[1]
+
+var float orbHigh   = na
+var float orbLow    = na
+var float orbOpen   = na
+var float orbClose  = na
+var int   startBar  = na
+var bool  rangeDone = false
+var bool  brokeUp    = false
+var bool  brokeDown  = false
+var float extremeUp   = na
+var float extremeDown = na
+var bool  tradedLong  = false
+var bool  tradedShort = false
+var bool  dayDone     = false
+
+if rangeStart
+    orbHigh   := high
+    orbLow    := low
+    orbOpen   := open
+    startBar  := bar_index
+    rangeDone := false
+    brokeUp    := false
+    brokeDown  := false
+    extremeUp   := na
+    extremeDown := na
+    tradedLong  := false
+    tradedShort := false
+    dayDone     := false
+else if inRange
+    orbHigh := math.max(orbHigh, high)
+    orbLow  := math.min(orbLow, low)
+
+if inRange
+    orbClose := close
+
+if rangeEnd
+    rangeDone := true
+
+orbMid      = (orbHigh + orbLow) / 2
+rangeHeight = orbHigh - orbLow
+
+// Track breakouts and the post-breakout extremes (used by the failed-breakout fade)
+if rangeDone and not inRange
+    if close > orbHigh
+        brokeUp := true
+    if close < orbLow
+        brokeDown := true
+    if brokeUp
+        extremeUp := na(extremeUp) ? high : math.max(extremeUp, high)
+    if brokeDown
+        extremeDown := na(extremeDown) ? low : math.min(extremeDown, low)
+
+// --- Entry signals ---
+vwapVal = ta.vwap
+volAvg  = ta.sma(volume, volLen)
+volOk   = volume > volAvg * volMult
+
+crossUp   = ta.crossover(close, orbHigh)
+crossDown = ta.crossunder(close, orbLow)
+
+bool longSig  = false
+bool shortSig = false
+if technique == T1
+    longSig  := crossUp
+    shortSig := crossDown
+else if technique == T2
+    longSig  := brokeUp[1] and low <= orbHigh and close >= orbHigh
+    shortSig := brokeDown[1] and high >= orbLow and close <= orbLow
+else if technique == T3
+    longSig  := brokeDown[1] and ta.crossover(close, orbLow) and close < orbHigh
+    shortSig := brokeUp[1] and ta.crossunder(close, orbHigh) and close > orbLow
+else if technique == T4
+    longSig  := crossUp and volOk and close > vwapVal
+    shortSig := crossDown and volOk and close < vwapVal
+else
+    bool rangeBull = orbClose > orbOpen
+    longSig  := rangeEnd and rangeBull
+    shortSig := rangeEnd and not rangeBull
+
+// --- Stop placement ---
+isFade = technique == T3
+autoLongStop  = isFade ? extremeDown : technique == T5 ? orbLow : orbMid
+autoShortStop = isFade ? extremeUp : technique == T5 ? orbHigh : orbMid
+float longStopP  = isFade ? extremeDown : stopMode == SM_MID ? orbMid : stopMode == SM_OPP ? orbLow : autoLongStop
+float shortStopP = isFade ? extremeUp : stopMode == SM_MID ? orbMid : stopMode == SM_OPP ? orbHigh : autoShortStop
+
+// --- Order management state ---
+var float longStop    = na
+var float longTarget  = na
+var float longPartial = na
+var bool  longBE      = false
+var float shortStop    = na
+var float shortTarget  = na
+var float shortPartial = na
+var bool  shortBE      = false
+
+eodNow   = eodFlat and not na(time(timeframe.period, eodTime, tzName))
+canTrade = rangeDone and not inRange and not dayDone and strategy.position_size == 0
+
+if strategy.position_size == 0
+    longBE  := false
+    shortBE := false
+
+// --- Entries (risk-based position sizing: stop-out loses riskPct% of equity) ---
+if canTrade and longSig and allowLong and not (oneTradePerDay and tradedLong)
+    float riskAmt = close - longStopP
+    if riskAmt > 0
+        float qty = strategy.equity * (riskPct / 100) / riskAmt
+        strategy.entry("Long", strategy.long, qty=qty)
+        longStop    := longStopP
+        longPartial := close + riskAmt
+        longTarget  := targetMode == TGT_R ? close + rrMult * riskAmt : close + rangeHeight
+        tradedLong  := true
+
+if canTrade and shortSig and allowShort and not (oneTradePerDay and tradedShort)
+    float riskAmt = shortStopP - close
+    if riskAmt > 0
+        float qty = strategy.equity * (riskPct / 100) / riskAmt
+        strategy.entry("Short", strategy.short, qty=qty)
+        shortStop    := shortStopP
+        shortPartial := close - riskAmt
+        shortTarget  := targetMode == TGT_R ? close - rrMult * riskAmt : close - rangeHeight
+        tradedShort  := true
+
+// --- Exits ---
+if strategy.position_size > 0
+    if takePartial and not longBE and high >= longPartial
+        longBE := true
+    float stopUse = longBE ? strategy.position_avg_price : longStop
+    if takePartial
+        strategy.exit("L-TP1", "Long", qty_percent=50, stop=stopUse, limit=longPartial)
+        strategy.exit("L-Run", "Long", qty_percent=100, stop=stopUse, limit=longTarget)
+    else
+        strategy.exit("L-Exit", "Long", stop=longStop, limit=longTarget)
+
+if strategy.position_size < 0
+    if takePartial and not shortBE and low <= shortPartial
+        shortBE := true
+    float stopUse = shortBE ? strategy.position_avg_price : shortStop
+    if takePartial
+        strategy.exit("S-TP1", "Short", qty_percent=50, stop=stopUse, limit=shortPartial)
+        strategy.exit("S-Run", "Short", qty_percent=100, stop=stopUse, limit=shortTarget)
+    else
+        strategy.exit("S-Exit", "Short", stop=shortStop, limit=shortTarget)
+
+if eodNow
+    dayDone := true
+    if strategy.position_size != 0
+        strategy.close_all(comment="EOD flat")
+
+// --- Draw the opening range (same look as the ORB Multi indicator) ---
+var line  hiLine  = na
+var line  loLine  = na
+var line  midLine = na
+var label hiLabel  = na
+var label loLabel  = na
+var label midLabel = na
+
+if rangeStart
+    hiLine  := na
+    loLine  := na
+    midLine := na
+    hiLabel  := na
+    loLabel  := na
+    midLabel := na
+
+if rangeEnd and not na(orbHigh)
+    hiLine  := line.new(startBar, orbHigh, bar_index, orbHigh, color=color.green,  width=2, style=line.style_solid)
+    loLine  := line.new(startBar, orbLow,  bar_index, orbLow,  color=color.red,    width=2, style=line.style_solid)
+    midLine := line.new(startBar, orbMid,  bar_index, orbMid,  color=color.orange, width=2, style=line.style_solid)
+    hiLabel  := label.new(bar_index, orbHigh, "ORB High " + str.tostring(orbHigh, format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.green,  size=size.small)
+    loLabel  := label.new(bar_index, orbLow,  "ORB Low "  + str.tostring(orbLow,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.red,    size=size.small)
+    midLabel := label.new(bar_index, orbMid,  "ORB Mid "  + str.tostring(orbMid,  format.mintick), style=label.style_label_left, color=color.new(color.black, 100), textcolor=color.orange, size=size.small)
+
+if not inRange and not na(hiLine)
+    line.set_x2(hiLine, bar_index)
+    line.set_x2(loLine, bar_index)
+    line.set_x2(midLine, bar_index)
+    label.set_x(hiLabel, bar_index)
+    label.set_x(loLabel, bar_index)
+    label.set_x(midLabel, bar_index)
+
+plot(showVwap ? vwapVal : na, "Session VWAP", color=color.new(color.blue, 0), linewidth=1)
