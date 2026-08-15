@@ -1,0 +1,255 @@
+//@version=6
+indicator("NY ORB — 30 Min Opening Range Breakout", "NY ORB 30m", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// =========================================================================
+// NY Session Opening Range Breakout (9:30-10:00 NY), 5-minute close confirmation
+//
+// Design decisions made without user sign-off (flagged in full detail in the
+// script's accompanying report, not just here):
+//   1. Stop loss default = opposite side of the opening range (configurable
+//      to "breakout candle wick" instead).
+//   2. Take-profit = 2R/3R ladder, 50% off at each leg, stop moved to
+//      breakeven after the first leg (2R) fills.
+//   3. Re-entry after a failed (stopped-out) breakout is OFF by default —
+//      only the first breakout per day is taken. Optional toggle allows one
+//      re-entry (opposite-direction retest) after a stop-out.
+//   4. A trade still open when the next day's opening range begins is force-
+//      closed at the prior bar's close and scored into stats as an "EOD" exit.
+// =========================================================================
+
+// --- Inputs: Opening Range ---
+orSession   = input.session("0930-1000", "Opening Range Window", group="Opening Range", tooltip="NY session window that defines the opening range. Default is the first 30 minutes of NY cash open.")
+tzName      = input.string("America/New_York", "Timezone", group="Opening Range", tooltip="IANA timezone used to interpret the window above. Handles DST automatically — do not use a fixed UTC offset.")
+breakoutTF  = input.timeframe("5", "Breakout Confirmation Timeframe", group="Opening Range", tooltip="Entries trigger only on a CLOSE of this timeframe outside the opening range. Spec calls for 5-minute closes; changeable but not recommended.")
+
+// --- Inputs: Trade Rules ---
+slMode      = input.string("OR Opposite Side", "Stop Loss Mode", options=["OR Opposite Side", "Breakout Candle Wick"], group="Trade Rules", tooltip="OR Opposite Side: SL at the far edge of the opening range (wider, fewer stop-outs, worse R on winners). Breakout Candle Wick: SL at the breakout candle's own opposite wick (tighter, more stop-outs, better R on winners). Design decision — flagged for review.")
+rr1         = input.float(2.0, "TP1 (R multiple)", minval=0.5, step=0.5, group="Trade Rules")
+rr2         = input.float(3.0, "TP2 (R multiple)", minval=0.5, step=0.5, group="Trade Rules")
+tp1Pct      = input.float(50, "Size Closed at TP1 (%)", minval=10, maxval=100, step=10, group="Trade Rules", tooltip="Remaining size runs to TP2 with the stop moved to breakeven after TP1 fills.")
+allowReentry = input.bool(false, "Allow One Re-Entry After Stop-Out", group="Trade Rules", tooltip="Default OFF: only the first breakout per day is traded. If ON, a single re-entry is allowed same-day after an SL stop-out (e.g. a failed long stopping out, then a valid short breakout later). TP-based exits never re-arm — one profitable attempt per day is final.")
+
+// --- Inputs: Appearance ---
+orBoxColor  = input.color(color.new(color.blue, 85), "OR Box Fill", group="Appearance")
+orBorderCol = input.color(color.new(color.blue, 40), "OR Box Border", group="Appearance")
+longCol     = input.color(color.new(color.lime, 0), "Long / TP Color", group="Appearance")
+shortCol    = input.color(color.new(color.red, 0), "Short / SL Color", group="Appearance")
+entryCol    = input.color(color.new(color.orange, 0), "Entry Line Color", group="Appearance")
+showTable   = input.bool(true, "Show Performance Stats Table", group="Appearance")
+tablePos    = input.string(position.top_right, "Table Position", options=[position.top_right, position.top_left, position.bottom_right, position.bottom_left], group="Appearance")
+
+// =========================================================================
+// Opening range construction (native chart resolution)
+// =========================================================================
+inOR       = not na(time(timeframe.period, orSession, tzName))
+rangeStart = inOR and not inOR[1]
+rangeEnd   = not inOR and inOR[1]
+
+var float orHigh      = na
+var float orLow       = na
+var int   orStartBar  = na
+var bool  orComplete  = false
+var box   orBox       = na
+
+var int   tradesToday = 0
+var bool  dayLocked   = false  // true once no further entries are allowed today
+
+if rangeStart
+    orHigh     := high
+    orLow      := low
+    orStartBar := bar_index
+    orComplete := false
+    orBox      := na
+    tradesToday := 0
+    dayLocked   := false
+else if inOR
+    orHigh := math.max(orHigh, high)
+    orLow  := math.min(orLow, low)
+
+if rangeEnd and not na(orHigh)
+    orComplete := true
+    orBox := box.new(orStartBar, orHigh, bar_index, orLow, border_color=orBorderCol, bgcolor=orBoxColor, extend=extend.none)
+    label.new(orStartBar, orHigh, "OR", style=label.style_label_down, color=color.new(color.blue, 100), textcolor=orBorderCol, size=size.small)
+
+if not inOR and not na(orBox)
+    box.set_right(orBox, bar_index)
+
+// Warn if the chart timeframe is coarser than the breakout confirmation timeframe:
+// request.security() only surfaces the LAST lower-timeframe bar per chart bar, so on
+// a chart timeframe above the breakout TF, intermediate 5m closes can be skipped.
+if barstate.islast and timeframe.in_seconds() > timeframe.in_seconds(breakoutTF)
+    label.new(bar_index, high, "⚠ Chart TF > breakout TF (" + breakoutTF + "m): intermediate closes may be skipped. Use a " + breakoutTF + "m chart or lower for fully accurate signals.", style=label.style_label_down, color=color.new(color.yellow, 20), textcolor=color.black, size=size.small)
+
+// =========================================================================
+// 5-minute (or configured) close stream, resolved once per closed bar
+// =========================================================================
+[t5, h5, l5, c5] = request.security(syminfo.tickerid, breakoutTF, [time, high, low, close], lookahead=barmerge.lookahead_off)
+newBar5 = ta.change(t5) != 0
+t5c = t5[1]
+h5c = h5[1]
+l5c = l5[1]
+c5c = c5[1]
+
+// =========================================================================
+// Trade state machine (manual — this is an indicator, not strategy(), so
+// entries/exits/stats are tracked bar-by-bar to produce a real hit-rate table)
+// =========================================================================
+var bool  tradeOpen   = false
+var int   tradeDir    = 0
+var float entryPrice  = na
+var float slPrice     = na
+var float tp1Price    = na
+var float tp2Price    = na
+var bool  tp1Done     = false
+
+var line entryLine = na
+var line slLine    = na
+var line tp1Line   = na
+var line tp2Line   = na
+var float riskAtEntry = na
+
+var int   totalTrades = 0
+var int   wins        = 0
+var int   losses      = 0
+var int   tp1Hits      = 0
+var int   tp2Hits      = 0
+var int   eodExits    = 0
+var float sumR         = 0.0
+
+f_closeLines() =>
+    if not na(entryLine)
+        line.set_x2(entryLine, bar_index)
+        line.set_x2(slLine, bar_index)
+        line.set_x2(tp1Line, bar_index)
+        line.set_x2(tp2Line, bar_index)
+
+f_recordTrade(rMultiple, isWin, exitTag) =>
+    totalTrades := totalTrades + 1
+    sumR := sumR + rMultiple
+    if isWin
+        wins := wins + 1
+    else
+        losses := losses + 1
+    label.new(bar_index, slPrice, exitTag + " " + str.tostring(rMultiple, "#.##") + "R", style=tradeDir == 1 ? label.style_label_up : label.style_label_down, color=isWin ? color.new(longCol, 20) : color.new(shortCol, 20), textcolor=color.white, size=size.tiny)
+
+// --- New breakout entry (only when no trade open, OR complete, and day not locked) ---
+canEnter = orComplete and not tradeOpen and not dayLocked and not na(orHigh)
+
+if newBar5 and canEnter
+    bool longSignal  = c5c > orHigh
+    bool shortSignal = c5c < orLow
+    if longSignal or shortSignal
+        tradeDir   := longSignal ? 1 : -1
+        entryPrice := c5c
+        tp1Done    := false
+        tradesToday := tradesToday + 1
+
+        if tradeDir == 1
+            slPrice := slMode == "OR Opposite Side" ? orLow : l5c
+        else
+            slPrice := slMode == "OR Opposite Side" ? orHigh : h5c
+
+        float risk = math.abs(entryPrice - slPrice)
+        if risk > 0
+            tp1Price := tradeDir == 1 ? entryPrice + rr1 * risk : entryPrice - rr1 * risk
+            tp2Price := tradeDir == 1 ? entryPrice + rr2 * risk : entryPrice - rr2 * risk
+            riskAtEntry := risk
+            tradeOpen := true
+
+            entryLine := line.new(bar_index, entryPrice, bar_index, entryPrice, color=entryCol, width=2, style=line.style_solid)
+            slLine    := line.new(bar_index, slPrice, bar_index, slPrice, color=shortCol, width=1, style=line.style_dashed)
+            tp1Line   := line.new(bar_index, tp1Price, bar_index, tp1Price, color=longCol, width=1, style=line.style_dashed)
+            tp2Line   := line.new(bar_index, tp2Price, bar_index, tp2Price, color=longCol, width=2, style=line.style_dashed)
+
+            label.new(bar_index, tradeDir == 1 ? low : high, (tradeDir == 1 ? "▲ LONG " : "▼ SHORT ") + str.tostring(entryPrice, format.mintick), style=tradeDir == 1 ? label.style_label_up : label.style_label_down, color=tradeDir == 1 ? color.new(longCol, 20) : color.new(shortCol, 20), textcolor=color.white, size=size.small)
+
+            // one breakout attempt consumes the day unless re-entry is explicitly allowed
+            if not allowReentry
+                dayLocked := true
+
+// --- Manage open trade: extend lines, check SL/TP touches on native chart resolution ---
+if tradeOpen
+    line.set_x2(entryLine, bar_index)
+    line.set_x2(slLine, bar_index)
+    line.set_x2(tp1Line, bar_index)
+    line.set_x2(tp2Line, bar_index)
+
+    bool hitSL  = tradeDir == 1 ? low <= slPrice : high >= slPrice
+    bool hitTP1 = tradeDir == 1 ? high >= tp1Price : low <= tp1Price
+    bool hitTP2 = tradeDir == 1 ? high >= tp2Price : low <= tp2Price
+
+    if not tp1Done
+        // conservative worst-case ordering: if SL and TP1 both trade within the same bar, count the stop first
+        if hitSL
+            f_closeLines()
+            f_recordTrade(-1.0, false, "SL")
+            tradeOpen := false
+            if allowReentry and tradesToday < 2
+                dayLocked := false
+            else
+                dayLocked := true
+        else if hitTP1
+            tp1Done := true
+            tp1Hits := tp1Hits + 1
+            slPrice := entryPrice
+            line.set_y1(slLine, slPrice)
+            line.set_y2(slLine, slPrice)
+            label.new(bar_index, tp1Price, "TP1 (" + str.tostring(rr1, "#.##") + "R) — SL to BE", style=tradeDir == 1 ? label.style_label_down : label.style_label_up, color=color.new(longCol, 20), textcolor=color.white, size=size.tiny)
+    else
+        // running the second half with stop at breakeven
+        if hitSL
+            float partial = (tp1Pct / 100.0) * rr1
+            f_closeLines()
+            f_recordTrade(partial, true, "BE")
+            tradeOpen := false
+            dayLocked := true
+        else if hitTP2
+            float full = (tp1Pct / 100.0) * rr1 + (1 - tp1Pct / 100.0) * rr2
+            tp2Hits := tp2Hits + 1
+            f_closeLines()
+            f_recordTrade(full, true, "TP2")
+            tradeOpen := false
+            dayLocked := true
+
+// --- Force-close any trade still open when the next day's opening range begins ---
+// Exit price uses the prior bar's close (the last print of the trading day being left behind).
+if rangeStart and tradeOpen
+    float exitPx = close[1]
+    float remR = riskAtEntry > 0 ? (tradeDir == 1 ? (exitPx - entryPrice) : (entryPrice - exitPx)) / riskAtEntry : 0.0
+    float partialR = tp1Done ? (tp1Pct / 100.0) * rr1 : 0.0
+    float totalR = tp1Done ? partialR + (1 - tp1Pct / 100.0) * remR : remR
+    f_closeLines()
+    eodExits := eodExits + 1
+    bool win = totalR > 0
+    f_recordTrade(totalR, win, "EOD")
+    tradeOpen := false
+
+// =========================================================================
+// Alerts
+// =========================================================================
+alertcondition(newBar5 and canEnter and c5c > orHigh, "NY ORB Long Breakout", "5m candle closed above the NY opening range high")
+alertcondition(newBar5 and canEnter and c5c < orLow, "NY ORB Short Breakout", "5m candle closed below the NY opening range low")
+
+// =========================================================================
+// Performance stats table
+// =========================================================================
+if showTable and barstate.islast
+    var table statsTable = table.new(tablePos, 2, 8, border_width=1)
+    table.cell(statsTable, 0, 0, "NY ORB — Performance", text_color=color.white, bgcolor=color.new(color.blue, 20), text_size=size.small)
+    table.cell(statsTable, 1, 0, "", bgcolor=color.new(color.blue, 20))
+    table.cell(statsTable, 0, 1, "Total Trades", text_size=size.small)
+    table.cell(statsTable, 1, 1, str.tostring(totalTrades), text_size=size.small)
+    table.cell(statsTable, 0, 2, "Wins / Losses", text_size=size.small)
+    table.cell(statsTable, 1, 2, str.tostring(wins) + " / " + str.tostring(losses), text_size=size.small)
+    winRate = totalTrades > 0 ? (wins / totalTrades) * 100.0 : na
+    table.cell(statsTable, 0, 3, "Win Rate", text_size=size.small)
+    table.cell(statsTable, 1, 3, na(winRate) ? "n/a" : str.tostring(winRate, "#.#") + "%", text_size=size.small)
+    table.cell(statsTable, 0, 4, "TP1 (" + str.tostring(rr1, "#.##") + "R) Hits", text_size=size.small)
+    table.cell(statsTable, 1, 4, str.tostring(tp1Hits) + (totalTrades > 0 ? " (" + str.tostring(tp1Hits / totalTrades * 100.0, "#.#") + "%)" : ""), text_size=size.small)
+    table.cell(statsTable, 0, 5, "TP2 (" + str.tostring(rr2, "#.##") + "R) Hits", text_size=size.small)
+    table.cell(statsTable, 1, 5, str.tostring(tp2Hits) + (totalTrades > 0 ? " (" + str.tostring(tp2Hits / totalTrades * 100.0, "#.#") + "%)" : ""), text_size=size.small)
+    table.cell(statsTable, 0, 6, "EOD Exits", text_size=size.small)
+    table.cell(statsTable, 1, 6, str.tostring(eodExits), text_size=size.small)
+    avgR = totalTrades > 0 ? sumR / totalTrades : na
+    table.cell(statsTable, 0, 7, "Avg R / Total R", text_size=size.small)
+    table.cell(statsTable, 1, 7, (na(avgR) ? "n/a" : str.tostring(avgR, "#.##")) + " / " + str.tostring(sumR, "#.##"), text_size=size.small)
